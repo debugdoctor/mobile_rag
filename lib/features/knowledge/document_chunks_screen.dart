@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app_providers.dart';
 import '../../core/i18n.dart';
 import '../../domain/models.dart';
+import '../../widgets/async_state_view.dart';
 
 class DocumentChunksScreen extends ConsumerStatefulWidget {
   const DocumentChunksScreen({
@@ -37,7 +38,22 @@ class _DocumentChunksScreenState extends ConsumerState<DocumentChunksScreen> {
       _error = null;
     });
     final rag = ref.read(ragServiceProvider);
-    final doc = await rag.getDocument(widget.documentId);
+    Document? doc;
+    List<DocumentChunk> chunks = [];
+    try {
+      doc = await rag.getDocument(widget.documentId);
+      if (doc != null) {
+        chunks = await rag.listDocumentChunks(widget.documentId);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _error = 'error.unknown';
+        });
+      }
+      return;
+    }
     if (doc == null) {
       setState(() {
         _isLoading = false;
@@ -45,7 +61,6 @@ class _DocumentChunksScreenState extends ConsumerState<DocumentChunksScreen> {
       });
       return;
     }
-    final chunks = await rag.listDocumentChunks(widget.documentId);
     if (!mounted) {
       return;
     }
@@ -103,25 +118,27 @@ class _DocumentChunksScreenState extends ConsumerState<DocumentChunksScreen> {
           ),
         ],
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _error != null
-              ? Center(child: Text(translate(locale, _error!)))
-              : _chunks.isEmpty
-                  ? Center(child: Text(translate(locale, 'knowledge.documentChunks.empty')))
-                  : ListView.builder(
-                      padding: const EdgeInsets.all(16),
-                      itemCount: _chunks.length,
-                      itemBuilder: (context, index) {
-                        final chunk = _chunks[index];
-                        return Card(
-                          child: ListTile(
-                            title: Text(translate(locale, 'knowledge.documentChunks.chunkTitle', {'index': index + 1})),
-                            subtitle: Text(chunk.content),
-                          ),
-                        );
-                      },
-                    ),
+      body: AsyncStateView(
+        isLoading: _isLoading,
+        isEmpty: !_isLoading && _error == null && _chunks.isEmpty,
+        emptyMessage: translate(locale, 'knowledge.documentChunks.empty'),
+        errorMessage: _error != null ? translate(locale, _error!) : null,
+        onRetry: _load,
+        retryLabel: translate(locale, 'common.retry'),
+        child: ListView.builder(
+          padding: const EdgeInsets.all(16),
+          itemCount: _chunks.length,
+          itemBuilder: (context, index) {
+            final chunk = _chunks[index];
+            return Card(
+              child: ListTile(
+                title: Text(translate(locale, 'knowledge.documentChunks.chunkTitle', {'index': index + 1})),
+                subtitle: Text(chunk.content),
+              ),
+            );
+          },
+        ),
+      ),
     );
   }
 }

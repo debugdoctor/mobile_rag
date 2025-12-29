@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+
+import 'package:dio/dio.dart';
 
 import '../core/i18n.dart';
 import '../domain/models.dart';
@@ -12,13 +15,39 @@ const _contextLimit = 6;
 const _candidateLimit = 12;
 const _evidenceLimit = 4;
 const _embeddingBatchSize = 16;
+const _embeddingCandidateMultiplier = 4;
+const _streamUpdateInterval = Duration(milliseconds: 250);
 
 class EmbeddingProgress {
-  EmbeddingProgress({required this.stage, this.current, this.total});
+  EmbeddingProgress({
+    required this.stage,
+    this.current,
+    this.total,
+    this.fileCurrent,
+    this.fileTotal,
+  });
 
   final String stage;
   final int? current;
   final int? total;
+  final int? fileCurrent;
+  final int? fileTotal;
+}
+
+class StreamedMessageUpdate {
+  StreamedMessageUpdate({
+    required this.conversationId,
+    required this.messageId,
+    this.message,
+    this.isDone = false,
+    this.isDeleted = false,
+  });
+
+  final String conversationId;
+  final String messageId;
+  final Message? message;
+  final bool isDone;
+  final bool isDeleted;
 }
 
 class RagVisualizationData {
@@ -82,6 +111,15 @@ class RagService {
   final DbService _db;
   final StorageService _storage;
   final ApiService _api;
+  final StreamController<StreamedMessageUpdate> _streamUpdates = StreamController.broadcast();
+  final Map<String, String> _activeStreamMessageIds = {};
+  final Map<String, Message> _activeStreamMessages = {};
+
+  Stream<StreamedMessageUpdate> get streamingUpdates => _streamUpdates.stream;
+
+  String? activeStreamingMessageId(String conversationId) => _activeStreamMessageIds[conversationId];
+
+  Message? activeStreamingMessage(String conversationId) => _activeStreamMessages[conversationId];
 
   Future<List<KnowledgeBase>> listKnowledgeBases() async {
     return _db.listKnowledgeBases();
@@ -134,6 +172,10 @@ class RagService {
     return _db.deleteKnowledgeBase(id);
   }
 
+  Future<void> deleteMessage(String messageId) async {
+    return _db.deleteMessage(messageId);
+  }
+
   Future<void> clearKnowledgeBaseDocuments(String knowledgeBaseId) async {
     return _db.clearKnowledgeBaseDocuments(knowledgeBaseId);
   }
@@ -170,7 +212,8 @@ class RagService {
       embeddingModel: embeddingModel,
       chunkSeparators: chunkSeparators,
     );
-    onProgress?.call(EmbeddingProgress(stage: 'saving'));
+    final chunkCount = result.chunks.length;
+    onProgress?.call(EmbeddingProgress(stage: 'saving', current: chunkCount, total: chunkCount));
     return _db.createDocument(
       knowledgeBaseId: knowledgeBaseId,
       title: title,
@@ -207,7 +250,8 @@ class RagService {
         embeddingModel: embeddingModel,
         chunkSeparators: chunkSeparators,
       );
-      onProgress?.call(EmbeddingProgress(stage: 'saving'));
+      final chunkCount = result.chunks.length;
+      onProgress?.call(EmbeddingProgress(stage: 'saving', current: chunkCount, total: chunkCount));
       return _db.updateDocument(
         documentId: documentId,
         title: title,
@@ -253,7 +297,8 @@ class RagService {
       embeddingModel: embeddingModel,
       chunkSeparators: chunkSeparators,
     );
-    onProgress?.call(EmbeddingProgress(stage: 'saving'));
+    final chunkCount = result.chunks.length;
+    onProgress?.call(EmbeddingProgress(stage: 'saving', current: chunkCount, total: chunkCount));
     await _db.rebuildDocumentChunks(
       documentId: documentId,
       content: content,
@@ -347,24 +392,31 @@ class RagService {
     String content, {
     List<String>? knowledgeBaseIds,
     String? embeddingModel,
+    String? attachmentsContent,
+    String? systemPromptContent,
   }) async {
     final history = await _db.listMessages(conversationId);
     final locale = await _storage.getLocale();
     final config = await _storage.getRagConfig();
     final candidateLimit = _resolveCandidateLimit(config);
     final retrievalMode = config.retrievalMode;
-    final queryEmbedding = await _resolveQueryEmbedding(content, retrievalMode, embeddingModel);
+    final queryText = _mergeQuery(content, attachmentsContent);
+    final queryEmbedding = await _resolveQueryEmbedding(queryText, retrievalMode, embeddingModel);
+    final disableKnowledge = knowledgeBaseIds != null && knowledgeBaseIds.isEmpty;
 
-    final candidates = retrievalMode == 'document'
+    final candidates = disableKnowledge
         ? <ChunkRow>[]
-        : queryEmbedding != null
-            ? await _db.listDocumentChunksForKnowledgeBases(knowledgeBaseIds: knowledgeBaseIds)
-            : await _db.searchDocumentChunks(content, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
+        : retrievalMode == 'document'
+            ? <ChunkRow>[]
+            : queryEmbedding != null
+                ? await _db.listDocumentChunksForKnowledgeBases(knowledgeBaseIds: knowledgeBaseIds)
+                : await _db.searchDocumentChunks(queryText, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
 
     final rankedChunks =
-        retrievalMode == 'document' ? <RankedChunk>[] : _rankChunks(content, candidates, queryEmbedding);
-    final topChunks = rankedChunks.take(_contextLimit).toList();
-    final evidenceItems = rankedChunks.take(_evidenceLimit).map((chunk) => chunk.evidence).toList();
+        retrievalMode == 'document' ? <RankedChunk>[] : _rankChunks(queryText, candidates, queryEmbedding);
+    final filteredChunks = _applyChunkSimilarityThreshold(rankedChunks, config.retrievalSimilarityThreshold);
+    final topChunks = filteredChunks.take(_contextLimit).toList();
+    final evidenceItems = filteredChunks.take(_evidenceLimit).map((chunk) => chunk.evidence).toList();
 
     var context = '';
     var evidence = <Evidence>[];
@@ -372,15 +424,23 @@ class RagService {
     if (topChunks.isNotEmpty) {
       context = _buildChunkContext(topChunks, locale);
       evidence = evidenceItems;
-    } else if (retrievalMode != 'chunk') {
-      final docCandidates = await _db.searchDocuments(content, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
-      final rankedDocs = _rankDocuments(content, docCandidates);
-      final topDocs = rankedDocs.take(_contextLimit).toList();
+    } else if (retrievalMode != 'chunk' && !disableKnowledge) {
+      final docCandidates = await _db.searchDocuments(queryText, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
+      final rankedDocs = _rankDocuments(queryText, docCandidates);
+      final filteredDocs = _applyDocumentSimilarityThreshold(rankedDocs, config.retrievalSimilarityThreshold);
+      final topDocs = filteredDocs.take(_contextLimit).toList();
       context = _buildContext(topDocs, locale);
-      evidence = rankedDocs.take(_evidenceLimit).map((doc) => doc.evidence).toList();
+      evidence = filteredDocs.take(_evidenceLimit).map((doc) => doc.evidence).toList();
     }
 
-    final messages = _buildMessages(history, content, context, locale);
+    final messages = _buildMessages(
+      history,
+      content,
+      context,
+      locale,
+      attachmentsContent: attachmentsContent,
+      systemPromptContent: systemPromptContent,
+    );
     final answer = await _api.requestAiAnswer(AiRequestOptions(messages: messages));
     final metadata = evidence.isNotEmpty ? MessageMetadata(query: content, evidence: evidence) : null;
     return _db.addMessage(conversationId, MessageRole.assistant, answer, metadata: metadata);
@@ -392,24 +452,35 @@ class RagService {
     void Function(String chunk) onChunk, {
     List<String>? knowledgeBaseIds,
     String? embeddingModel,
+    String? attachmentsContent,
+    void Function(Message message)? onStart,
+    String? systemPromptContent,
   }) async {
     final history = await _db.listMessages(conversationId);
     final locale = await _storage.getLocale();
     final config = await _storage.getRagConfig();
     final candidateLimit = _resolveCandidateLimit(config);
     final retrievalMode = config.retrievalMode;
-    final queryEmbedding = await _resolveQueryEmbedding(content, retrievalMode, embeddingModel);
+    final queryText = _mergeQuery(content, attachmentsContent);
+    final queryEmbedding = await _resolveQueryEmbedding(queryText, retrievalMode, embeddingModel);
+    final disableKnowledge = knowledgeBaseIds != null && knowledgeBaseIds.isEmpty;
 
-    final candidates = retrievalMode == 'document'
+    final candidates = disableKnowledge
         ? <ChunkRow>[]
-        : queryEmbedding != null
-            ? await _db.listDocumentChunksForKnowledgeBases(knowledgeBaseIds: knowledgeBaseIds)
-            : await _db.searchDocumentChunks(content, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
+        : retrievalMode == 'document'
+            ? <ChunkRow>[]
+            : queryEmbedding != null
+                ? await _db.listDocumentChunksForKnowledgeBases(
+                    knowledgeBaseIds: knowledgeBaseIds,
+                    limit: _resolveEmbeddingCandidateLimit(candidateLimit),
+                  )
+                : await _db.searchDocumentChunks(queryText, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
 
     final rankedChunks =
-        retrievalMode == 'document' ? <RankedChunk>[] : _rankChunks(content, candidates, queryEmbedding);
-    final topChunks = rankedChunks.take(_contextLimit).toList();
-    final evidenceItems = rankedChunks.take(_evidenceLimit).map((chunk) => chunk.evidence).toList();
+        retrievalMode == 'document' ? <RankedChunk>[] : _rankChunks(queryText, candidates, queryEmbedding);
+    final filteredChunks = _applyChunkSimilarityThreshold(rankedChunks, config.retrievalSimilarityThreshold);
+    final topChunks = filteredChunks.take(_contextLimit).toList();
+    final evidenceItems = filteredChunks.take(_evidenceLimit).map((chunk) => chunk.evidence).toList();
 
     var context = '';
     var evidence = <Evidence>[];
@@ -417,37 +488,138 @@ class RagService {
     if (topChunks.isNotEmpty) {
       context = _buildChunkContext(topChunks, locale);
       evidence = evidenceItems;
-    } else if (retrievalMode != 'chunk') {
-      final docCandidates = await _db.searchDocuments(content, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
-      final rankedDocs = _rankDocuments(content, docCandidates);
-      final topDocs = rankedDocs.take(_contextLimit).toList();
+    } else if (retrievalMode != 'chunk' && !disableKnowledge) {
+      final docCandidates = await _db.searchDocuments(queryText, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
+      final rankedDocs = _rankDocuments(queryText, docCandidates);
+      final filteredDocs = _applyDocumentSimilarityThreshold(rankedDocs, config.retrievalSimilarityThreshold);
+      final topDocs = filteredDocs.take(_contextLimit).toList();
       context = _buildContext(topDocs, locale);
-      evidence = rankedDocs.take(_evidenceLimit).map((doc) => doc.evidence).toList();
+      evidence = filteredDocs.take(_evidenceLimit).map((doc) => doc.evidence).toList();
     }
 
-    final messages = _buildMessages(history, content, context, locale);
+    final messages = _buildMessages(
+      history,
+      content,
+      context,
+      locale,
+      attachmentsContent: attachmentsContent,
+      systemPromptContent: systemPromptContent,
+    );
     final metadata = evidence.isNotEmpty ? MessageMetadata(query: content, evidence: evidence) : null;
-    final tempMessageId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
-
-    var fullContent = '';
-    await _api.requestAiAnswerStream(
-      AiRequestOptions(messages: messages),
-      (chunk) {
-        fullContent += chunk;
-        onChunk(fullContent);
-      },
+    final streamMessage = await _db.addMessage(conversationId, MessageRole.assistant, '');
+    _activeStreamMessageIds[conversationId] = streamMessage.id;
+    _activeStreamMessages[conversationId] = streamMessage;
+    onStart?.call(streamMessage);
+    _streamUpdates.add(
+      StreamedMessageUpdate(
+        conversationId: conversationId,
+        messageId: streamMessage.id,
+        message: streamMessage,
+      ),
     );
 
-    if (fullContent.isEmpty) {
-      return Message(
-        id: tempMessageId,
+    var fullContent = '';
+    Timer? flushTimer;
+
+    void flushUpdate() {
+      final updated = Message(
+        id: streamMessage.id,
         role: MessageRole.assistant,
         content: fullContent,
+        createdAt: streamMessage.createdAt,
         metadata: metadata,
+      );
+      _activeStreamMessages[conversationId] = updated;
+      _streamUpdates.add(
+        StreamedMessageUpdate(
+          conversationId: conversationId,
+          messageId: streamMessage.id,
+          message: updated,
+        ),
       );
     }
 
-    return _db.addMessage(conversationId, MessageRole.assistant, fullContent, metadata: metadata);
+    void scheduleFlush() {
+      if (flushTimer != null) {
+        return;
+      }
+      flushTimer = Timer(_streamUpdateInterval, () {
+        flushTimer = null;
+        flushUpdate();
+      });
+    }
+    try {
+      await _api.requestAiAnswerStream(
+        AiRequestOptions(messages: messages),
+        (chunk) {
+          fullContent += chunk;
+          _activeStreamMessages[conversationId] = Message(
+            id: streamMessage.id,
+            role: MessageRole.assistant,
+            content: fullContent,
+            createdAt: streamMessage.createdAt,
+            metadata: metadata,
+          );
+          scheduleFlush();
+          onChunk(fullContent);
+        },
+      );
+    } catch (error) {
+      flushTimer?.cancel();
+      if (fullContent.isEmpty) {
+        await _db.deleteMessage(streamMessage.id);
+        _streamUpdates.add(
+          StreamedMessageUpdate(
+            conversationId: conversationId,
+            messageId: streamMessage.id,
+            isDeleted: true,
+            isDone: true,
+          ),
+        );
+      } else {
+        flushUpdate();
+        await _db.updateMessageContent(streamMessage.id, fullContent);
+        _streamUpdates.add(
+          StreamedMessageUpdate(
+            conversationId: conversationId,
+            messageId: streamMessage.id,
+            message: Message(
+              id: streamMessage.id,
+              role: MessageRole.assistant,
+              content: fullContent,
+              createdAt: streamMessage.createdAt,
+              metadata: metadata,
+            ),
+            isDone: true,
+          ),
+        );
+      }
+      _activeStreamMessageIds.remove(conversationId);
+      _activeStreamMessages.remove(conversationId);
+      rethrow;
+    }
+
+    flushTimer?.cancel();
+    await _db.updateMessageContent(streamMessage.id, fullContent);
+    await _db.updateMessageMetadata(streamMessage.id, metadata);
+    final finalMessage = Message(
+      id: streamMessage.id,
+      role: MessageRole.assistant,
+      content: fullContent,
+      createdAt: streamMessage.createdAt,
+      metadata: metadata,
+    );
+    _streamUpdates.add(
+      StreamedMessageUpdate(
+        conversationId: conversationId,
+        messageId: streamMessage.id,
+        message: finalMessage,
+        isDone: true,
+      ),
+    );
+    _activeStreamMessageIds.remove(conversationId);
+    _activeStreamMessages.remove(conversationId);
+    return finalMessage;
   }
 
   Future<Message> sendMessageStreamWithVisualization(
@@ -457,6 +629,10 @@ class RagService {
     void Function(RagVisualizationStep step, RagVisualizationData data) onVisualizationUpdate, {
     List<String>? knowledgeBaseIds,
     String? embeddingModel,
+    CancelToken? cancelToken,
+    String? attachmentsContent,
+    void Function(Message message)? onStart,
+    String? systemPromptContent,
   }) async {
     final locale = await _storage.getLocale();
     final visualizationData = RagVisualizationData(
@@ -489,17 +665,24 @@ class RagService {
     final config = await _storage.getRagConfig();
     final candidateLimit = _resolveCandidateLimit(config);
     final retrievalMode = config.retrievalMode;
+    final queryText = _mergeQuery(content, attachmentsContent);
     final queryEmbedding = await _resolveQueryEmbedding(
-      content,
+      queryText,
       retrievalMode,
       embeddingEnabled ? embeddingModel : null,
     );
+    final disableKnowledge = knowledgeBaseIds != null && knowledgeBaseIds.isEmpty;
 
-    final candidates = retrievalMode == 'document'
+    final candidates = disableKnowledge
         ? <ChunkRow>[]
-        : queryEmbedding != null
-            ? await _db.listDocumentChunksForKnowledgeBases(knowledgeBaseIds: knowledgeBaseIds)
-            : await _db.searchDocumentChunks(content, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
+        : retrievalMode == 'document'
+            ? <ChunkRow>[]
+            : queryEmbedding != null
+                ? await _db.listDocumentChunksForKnowledgeBases(
+                    knowledgeBaseIds: knowledgeBaseIds,
+                    limit: _resolveEmbeddingCandidateLimit(candidateLimit),
+                  )
+                : await _db.searchDocumentChunks(queryText, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
 
     visualizationData.candidates = candidates.take(candidateLimit).map((candidate) {
       return RagVisualizationCandidate(
@@ -514,11 +697,12 @@ class RagService {
     onVisualizationUpdate(RagVisualizationStep.retrieval, visualizationData);
 
     final rankedChunks =
-        retrievalMode == 'document' ? <RankedChunk>[] : _rankChunks(content, candidates, queryEmbedding);
-    final topChunks = rankedChunks.take(_contextLimit).toList();
-    final evidenceItems = rankedChunks.take(_evidenceLimit).map((chunk) => chunk.evidence).toList();
+        retrievalMode == 'document' ? <RankedChunk>[] : _rankChunks(queryText, candidates, queryEmbedding);
+    final filteredChunks = _applyChunkSimilarityThreshold(rankedChunks, config.retrievalSimilarityThreshold);
+    final topChunks = filteredChunks.take(_contextLimit).toList();
+    final evidenceItems = filteredChunks.take(_evidenceLimit).map((chunk) => chunk.evidence).toList();
 
-    visualizationData.candidates = rankedChunks.take(candidateLimit).map((chunk) {
+    visualizationData.candidates = filteredChunks.take(candidateLimit).map((chunk) {
       return RagVisualizationCandidate(
         id: chunk.id,
         documentTitle: chunk.documentTitle,
@@ -538,14 +722,15 @@ class RagService {
     if (topChunks.isNotEmpty) {
       context = _buildChunkContext(topChunks, locale);
       evidence = evidenceItems;
-    } else if (retrievalMode != 'chunk') {
-      final docCandidates = await _db.searchDocuments(content, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
-      final rankedDocs = _rankDocuments(content, docCandidates);
-      final topDocs = rankedDocs.take(_contextLimit).toList();
+    } else if (retrievalMode != 'chunk' && !disableKnowledge) {
+      final docCandidates = await _db.searchDocuments(queryText, candidateLimit, knowledgeBaseIds: knowledgeBaseIds);
+      final rankedDocs = _rankDocuments(queryText, docCandidates);
+      final filteredDocs = _applyDocumentSimilarityThreshold(rankedDocs, config.retrievalSimilarityThreshold);
+      final topDocs = filteredDocs.take(_contextLimit).toList();
       context = _buildContext(topDocs, locale);
-      evidence = rankedDocs.take(_evidenceLimit).map((doc) => doc.evidence).toList();
+      evidence = filteredDocs.take(_evidenceLimit).map((doc) => doc.evidence).toList();
 
-      visualizationData.candidates = rankedDocs.map((doc) {
+      visualizationData.candidates = filteredDocs.take(candidateLimit).map((doc) {
         return RagVisualizationCandidate(
           id: doc.id,
           documentTitle: doc.title,
@@ -560,7 +745,14 @@ class RagService {
     }
 
     visualizationData.context = context;
-    final messages = _buildMessages(history, content, context, locale);
+    final messages = _buildMessages(
+      history,
+      content,
+      context,
+      locale,
+      attachmentsContent: attachmentsContent,
+      systemPromptContent: systemPromptContent,
+    );
     final prompt = _buildPromptPreview(messages);
     visualizationData.prompt = prompt;
     onVisualizationUpdate(RagVisualizationStep.prompt, visualizationData);
@@ -569,21 +761,126 @@ class RagService {
 
     onVisualizationUpdate(RagVisualizationStep.generating, visualizationData);
 
-    var fullContent = '';
-    await _api.requestAiAnswerStream(
-      AiRequestOptions(messages: messages),
-      (chunk) {
-        fullContent += chunk;
-        onChunk(fullContent);
-        visualizationData.answer = fullContent;
-        onVisualizationUpdate(RagVisualizationStep.generating, visualizationData);
-      },
+    final streamMessage = await _db.addMessage(conversationId, MessageRole.assistant, '');
+    _activeStreamMessageIds[conversationId] = streamMessage.id;
+    _activeStreamMessages[conversationId] = streamMessage;
+    onStart?.call(streamMessage);
+    _streamUpdates.add(
+      StreamedMessageUpdate(
+        conversationId: conversationId,
+        messageId: streamMessage.id,
+        message: streamMessage,
+      ),
     );
 
+    var fullContent = '';
+    Timer? flushTimer;
+
+    void flushUpdate() {
+      final updated = Message(
+        id: streamMessage.id,
+        role: MessageRole.assistant,
+        content: fullContent,
+        createdAt: streamMessage.createdAt,
+        metadata: metadata,
+      );
+      _activeStreamMessages[conversationId] = updated;
+      _streamUpdates.add(
+        StreamedMessageUpdate(
+          conversationId: conversationId,
+          messageId: streamMessage.id,
+          message: updated,
+        ),
+      );
+    }
+
+    void scheduleFlush() {
+      if (flushTimer != null) {
+        return;
+      }
+      flushTimer = Timer(_streamUpdateInterval, () {
+        flushTimer = null;
+        flushUpdate();
+      });
+    }
+    try {
+      await _api.requestAiAnswerStream(
+        AiRequestOptions(messages: messages),
+        (chunk) {
+          fullContent += chunk;
+          _activeStreamMessages[conversationId] = Message(
+            id: streamMessage.id,
+            role: MessageRole.assistant,
+            content: fullContent,
+            createdAt: streamMessage.createdAt,
+            metadata: metadata,
+          );
+          scheduleFlush();
+          onChunk(fullContent);
+          visualizationData.answer = fullContent;
+          onVisualizationUpdate(RagVisualizationStep.generating, visualizationData);
+        },
+        cancelToken: cancelToken,
+      );
+    } catch (error) {
+      flushTimer?.cancel();
+      if (fullContent.isEmpty) {
+        await _db.deleteMessage(streamMessage.id);
+        _streamUpdates.add(
+          StreamedMessageUpdate(
+            conversationId: conversationId,
+            messageId: streamMessage.id,
+            isDeleted: true,
+            isDone: true,
+          ),
+        );
+      } else {
+        flushUpdate();
+        await _db.updateMessageContent(streamMessage.id, fullContent);
+        _streamUpdates.add(
+          StreamedMessageUpdate(
+            conversationId: conversationId,
+            messageId: streamMessage.id,
+            message: Message(
+              id: streamMessage.id,
+              role: MessageRole.assistant,
+              content: fullContent,
+              createdAt: streamMessage.createdAt,
+              metadata: metadata,
+            ),
+            isDone: true,
+          ),
+        );
+      }
+      _activeStreamMessageIds.remove(conversationId);
+      _activeStreamMessages.remove(conversationId);
+      rethrow;
+    }
+
+    flushTimer?.cancel();
     visualizationData.answer = fullContent;
     onVisualizationUpdate(RagVisualizationStep.completed, visualizationData);
 
-    return _db.addMessage(conversationId, MessageRole.assistant, fullContent, metadata: metadata);
+    await _db.updateMessageContent(streamMessage.id, fullContent);
+    await _db.updateMessageMetadata(streamMessage.id, metadata);
+    final finalMessage = Message(
+      id: streamMessage.id,
+      role: MessageRole.assistant,
+      content: fullContent,
+      createdAt: streamMessage.createdAt,
+      metadata: metadata,
+    );
+    _streamUpdates.add(
+      StreamedMessageUpdate(
+        conversationId: conversationId,
+        messageId: streamMessage.id,
+        message: finalMessage,
+        isDone: true,
+      ),
+    );
+    _activeStreamMessageIds.remove(conversationId);
+    _activeStreamMessages.remove(conversationId);
+    return finalMessage;
   }
 
   Future<_ChunkEmbeddings> _buildChunkEmbeddings({
@@ -655,8 +952,10 @@ class RagService {
     List<Message> history,
     String content,
     String context,
-    String locale,
-  ) {
+    String locale, {
+    String? attachmentsContent,
+    String? systemPromptContent,
+  }) {
     final trimmedHistory = history
         .where((message) => message.role == MessageRole.user || message.role == MessageRole.assistant)
         .map((message) => AiMessage(role: message.role.name, content: message.content))
@@ -670,10 +969,16 @@ class RagService {
 
     final contextLabel = translate(locale, 'prompt.contextLabel');
     final questionLabel = translate(locale, 'prompt.questionLabel');
-    final userPrompt = context.isNotEmpty ? '$contextLabel:\n$context\n\n$questionLabel:\n$content' : content;
+    final attachmentLabel = translate(locale, 'prompt.attachmentLabel');
+    final attachmentText = (attachmentsContent ?? '').trim();
+    final questionBlock = '$questionLabel:\n$content';
+    final attachmentBlock = attachmentText.isNotEmpty ? '\n\n$attachmentLabel:\n$attachmentText' : '';
+    final userPrompt = context.isNotEmpty
+        ? '$contextLabel:\n$context\n\n$questionBlock$attachmentBlock'
+        : '$questionBlock$attachmentBlock';
 
     return [
-      AiMessage(role: 'system', content: translate(locale, 'prompt.system')),
+      AiMessage(role: 'system', content: systemPromptContent ?? translate(locale, 'prompt.system')),
       ...trimmedHistory,
       AiMessage(role: 'user', content: userPrompt),
     ];
@@ -681,6 +986,14 @@ class RagService {
 
   String _buildPromptPreview(List<AiMessage> messages) {
     return messages.map((message) => '${message.role.toUpperCase()}:\n${message.content}').join('\n\n');
+  }
+
+  String _mergeQuery(String content, String? attachmentsContent) {
+    final attachmentText = attachmentsContent?.trim();
+    if (attachmentText == null || attachmentText.isEmpty) {
+      return content;
+    }
+    return '$content\n\n$attachmentText';
   }
 
   String _buildChunkContext(List<RankedChunk> chunks, String locale) {
@@ -708,6 +1021,10 @@ class RagService {
       return config.retrievalTopK;
     }
     return _candidateLimit;
+  }
+
+  int _resolveEmbeddingCandidateLimit(int baseLimit) {
+    return max(baseLimit * _embeddingCandidateMultiplier, baseLimit);
   }
 
   List<RankedChunk> _rankChunks(String query, List<ChunkRow> chunks, List<double>? queryEmbedding) {
@@ -742,6 +1059,13 @@ class RagService {
       ..sort((a, b) => b.score.compareTo(a.score));
   }
 
+  List<RankedChunk> _applyChunkSimilarityThreshold(List<RankedChunk> chunks, double threshold) {
+    if (threshold <= 0) {
+      return chunks;
+    }
+    return chunks.where((chunk) => (chunk.evidence.similarity) >= threshold).toList();
+  }
+
   List<RankedDocument> _rankDocuments(String query, List<DocumentRow> docs) {
     final terms = _extractTerms(query);
     return docs
@@ -766,6 +1090,13 @@ class RagService {
         })
         .toList()
       ..sort((a, b) => b.score.compareTo(a.score));
+  }
+
+  List<RankedDocument> _applyDocumentSimilarityThreshold(List<RankedDocument> docs, double threshold) {
+    if (threshold <= 0) {
+      return docs;
+    }
+    return docs.where((doc) => (doc.evidence.similarity) >= threshold).toList();
   }
 
   _ScoreResult _scoreContent({required List<String> terms, required String content}) {

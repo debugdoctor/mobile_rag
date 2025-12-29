@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../../app_providers.dart';
 import '../../core/i18n.dart';
 import '../../domain/models.dart';
+import '../../widgets/async_state_view.dart';
 
 class KnowledgeScreen extends ConsumerStatefulWidget {
   const KnowledgeScreen({super.key});
@@ -17,6 +18,7 @@ class _KnowledgeScreenState extends ConsumerState<KnowledgeScreen> {
   final _searchController = TextEditingController();
   List<KnowledgeBase> _knowledgeBases = [];
   bool _isLoading = true;
+  String? _error;
 
   @override
   void initState() {
@@ -34,9 +36,21 @@ class _KnowledgeScreenState extends ConsumerState<KnowledgeScreen> {
   Future<void> _load() async {
     setState(() {
       _isLoading = true;
+      _error = null;
     });
     final rag = ref.read(ragServiceProvider);
-    final data = await rag.listKnowledgeBases();
+    List<KnowledgeBase> data = [];
+    try {
+      data = await rag.listKnowledgeBases();
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _error = 'error.unknown';
+        });
+      }
+      return;
+    }
     if (!mounted) {
       return;
     }
@@ -169,7 +183,10 @@ class _KnowledgeScreenState extends ConsumerState<KnowledgeScreen> {
             ),
             ElevatedButton(
               onPressed: () => Navigator.of(context).pop(true),
-              style: ElevatedButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.error,
+                foregroundColor: Theme.of(context).colorScheme.onError,
+              ),
               child: Text(translate(locale, 'common.delete')),
             ),
           ],
@@ -223,53 +240,60 @@ class _KnowledgeScreenState extends ConsumerState<KnowledgeScreen> {
               ),
             ),
             const SizedBox(height: 16),
-            if (_isLoading)
-              const Center(child: CircularProgressIndicator())
-            else if (filtered.isEmpty)
-              Center(child: Text(translate(locale, 'knowledge.empty')))
-            else
-              ...filtered.map(
-                (kb) => Card(
-                  child: ListTile(
-                    title: Text(kb.name),
-                    subtitle: Text(
-                      kb.description?.isNotEmpty == true
-                          ? kb.description!
-                          : translate(locale, 'knowledge.subtitle'),
-                    ),
-                    trailing: PopupMenuButton<String>(
-                      onSelected: (value) {
-                        switch (value) {
-                          case 'edit':
-                            _editKnowledgeBase(kb);
-                            break;
-                          case 'settings':
-                            context.go('/knowledge/${kb.id}/settings');
-                            break;
-                          case 'delete':
-                            _deleteKnowledgeBase(kb);
-                            break;
-                        }
-                      },
-                      itemBuilder: (context) => [
-                        PopupMenuItem(
-                          value: 'edit',
-                          child: Text(translate(locale, 'knowledge.edit')),
+            AsyncStateView(
+              isLoading: _isLoading,
+              isEmpty: !_isLoading && filtered.isEmpty,
+              emptyMessage: translate(locale, 'knowledge.empty'),
+              errorMessage: _error != null ? translate(locale, _error!) : null,
+              onRetry: _load,
+              retryLabel: translate(locale, 'common.retry'),
+              child: Column(
+                children: filtered
+                    .map(
+                      (kb) => Card(
+                        child: ListTile(
+                          title: Text(kb.name),
+                          subtitle: Text(
+                            kb.description?.isNotEmpty == true
+                                ? kb.description!
+                                : translate(locale, 'knowledge.subtitle'),
+                          ),
+                          trailing: PopupMenuButton<String>(
+                            onSelected: (value) {
+                              switch (value) {
+                                case 'edit':
+                                  _editKnowledgeBase(kb);
+                                  break;
+                                case 'settings':
+                                  context.go('/knowledge/${kb.id}/settings');
+                                  break;
+                                case 'delete':
+                                  _deleteKnowledgeBase(kb);
+                                  break;
+                              }
+                            },
+                            itemBuilder: (context) => [
+                              PopupMenuItem(
+                                value: 'edit',
+                                child: Text(translate(locale, 'knowledge.edit')),
+                              ),
+                              PopupMenuItem(
+                                value: 'settings',
+                                child: Text(translate(locale, 'knowledge.settings')),
+                              ),
+                              PopupMenuItem(
+                                value: 'delete',
+                                child: Text(translate(locale, 'knowledge.delete')),
+                              ),
+                            ],
+                          ),
+                          onTap: () => context.go('/knowledge/${kb.id}'),
                         ),
-                        PopupMenuItem(
-                          value: 'settings',
-                          child: Text(translate(locale, 'knowledge.settings')),
-                        ),
-                        PopupMenuItem(
-                          value: 'delete',
-                          child: Text(translate(locale, 'knowledge.delete')),
-                        ),
-                      ],
-                    ),
-                    onTap: () => context.go('/knowledge/${kb.id}'),
-                  ),
-                ),
+                      ),
+                    )
+                    .toList(),
               ),
+            ),
           ],
         ),
       ),

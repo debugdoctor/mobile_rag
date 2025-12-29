@@ -1,4 +1,4 @@
-package com.example.mobile_rag_flutter
+package com.aimerick.mobile_rag
 
 import io.flutter.embedding.android.FlutterActivity
 

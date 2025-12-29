@@ -1,7 +1,7 @@
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -11,6 +11,7 @@ import '../../core/i18n.dart';
 import '../../domain/models.dart';
 import '../../services/rag_service.dart';
 import '../../utils/chunking.dart';
+import '../../utils/file_text_extractor.dart';
 
 class KnowledgeDetailScreen extends ConsumerStatefulWidget {
   const KnowledgeDetailScreen({super.key, required this.knowledgeBaseId});
@@ -28,6 +29,8 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
   bool _isUploading = false;
   String? _error;
   EmbeddingProgress? _progress;
+  int? _fileIndex;
+  int? _fileTotal;
 
   @override
   void initState() {
@@ -79,7 +82,7 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
     try {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
-        allowedExtensions: const ['txt', 'md'],
+        allowedExtensions: supportedUploadExtensions,
         withData: true,
         allowMultiple: replaceTarget == null,
       );
@@ -90,9 +93,19 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
         });
         return;
       }
-      for (final file in result.files) {
+      _fileTotal = result.files.length;
+      for (var index = 0; index < result.files.length; index += 1) {
+        final file = result.files[index];
+        setState(() {
+          _fileIndex = index + 1;
+          _progress = EmbeddingProgress(
+            stage: 'reading',
+            fileCurrent: _fileIndex,
+            fileTotal: _fileTotal,
+          );
+        });
         final name = file.name;
-        if (!(name.endsWith('.txt') || name.endsWith('.md'))) {
+        if (!isSupportedUploadExtension(name)) {
           _showError(translate(locale, 'file.unsupportedType'));
           continue;
         }
@@ -102,7 +115,11 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
         }
 
         final bytes = file.bytes ?? await File(file.path!).readAsBytes();
-        final content = utf8.decode(bytes).trim();
+        final content = (await compute(extractTextFromFileBytesIsolate, {
+          'filename': name,
+          'bytes': bytes,
+        }))
+            .trim();
         if (content.isEmpty) {
           _showError(translate(locale, 'file.empty'));
           continue;
@@ -124,7 +141,13 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
             chunkSeparators: parseChunkSeparators(kb.chunkSeparators),
             onProgress: (progress) {
               setState(() {
-                _progress = progress;
+                _progress = EmbeddingProgress(
+                  stage: progress.stage,
+                  current: progress.current,
+                  total: progress.total,
+                  fileCurrent: _fileIndex,
+                  fileTotal: _fileTotal,
+                );
               });
             },
           );
@@ -140,7 +163,13 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
             chunkSeparators: parseChunkSeparators(kb.chunkSeparators),
             onProgress: (progress) {
               setState(() {
-                _progress = progress;
+                _progress = EmbeddingProgress(
+                  stage: progress.stage,
+                  current: progress.current,
+                  total: progress.total,
+                  fileCurrent: _fileIndex,
+                  fileTotal: _fileTotal,
+                );
               });
             },
           );
@@ -154,6 +183,8 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
         setState(() {
           _isUploading = false;
           _progress = null;
+          _fileIndex = null;
+          _fileTotal = null;
         });
       }
     }
@@ -210,7 +241,10 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
           ),
           ElevatedButton(
             onPressed: () => Navigator.of(context).pop(true),
-            style: ElevatedButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+              foregroundColor: Theme.of(context).colorScheme.onError,
+            ),
             child: Text(translate(locale, 'common.delete')),
           ),
         ],
@@ -237,7 +271,10 @@ class _KnowledgeDetailScreenState extends ConsumerState<KnowledgeDetailScreen> {
           ),
           ElevatedButton(
             onPressed: () => Navigator.of(context).pop(true),
-            style: ElevatedButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+              foregroundColor: Theme.of(context).colorScheme.onError,
+            ),
             child: Text(translate(locale, 'common.delete')),
           ),
         ],
@@ -368,15 +405,16 @@ class _EmbeddingProgressCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final stageLabel = switch (progress.stage) {
+      'reading' => translate(locale, 'knowledge.detail.embedding.reading'),
       'chunking' => translate(locale, 'knowledge.detail.embedding.chunking'),
       'embedding' => translate(locale, 'knowledge.detail.embedding.embedding'),
       'saving' => translate(locale, 'knowledge.detail.embedding.saving'),
       _ => translate(locale, 'common.loading'),
     };
 
-    final total = progress.total ?? 0;
-    final current = progress.current ?? 0;
-    final ratio = total > 0 ? current / total : null;
+    final fileTotal = progress.fileTotal ?? 0;
+    final fileCurrent = progress.fileCurrent ?? 0;
+    final ratio = fileTotal > 0 ? (fileCurrent / fileTotal).clamp(0.0, 1.0) : 0.0;
 
     return Card(
       child: Padding(
@@ -385,13 +423,18 @@ class _EmbeddingProgressCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(stageLabel),
-            if (ratio != null) ...[
-              const SizedBox(height: 8),
-              LinearProgressIndicator(value: ratio),
-              const SizedBox(height: 8),
-              Text(translate(locale, 'knowledge.detail.embedding.progress', {'current': current, 'total': total})),
-            ] else
-              const SizedBox(height: 8),
+            if (fileTotal > 0) ...[
+              const SizedBox(height: 4),
+              Text(
+                translate(
+                  locale,
+                  'knowledge.detail.embedding.fileProgress',
+                  {'current': fileCurrent, 'total': fileTotal},
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: ratio),
           ],
         ),
       ),

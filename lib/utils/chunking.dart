@@ -1,3 +1,5 @@
+import 'dart:math';
+
 const List<String> defaultChunkSeparators = ['\n'];
 
 int getDefaultChunkMinSize(int chunkMaxSize) {
@@ -54,16 +56,26 @@ List<String> splitIntoChunks(
   final safeMinSize = resolvedMinSize.clamp(1, safeMaxSize);
   final safeOverlap = chunkOverlap.round().clamp(0, safeMaxSize - 1);
   final resolvedSeparators = _normalizeSeparators(separators);
+  final separatorSet = resolvedSeparators.toSet();
   final chunks = <String>[];
   var start = 0;
 
   while (start < normalized.length) {
+    while (start < normalized.length && separatorSet.contains(normalized[start])) {
+      start += 1;
+    }
+    if (start >= normalized.length) {
+      break;
+    }
     final remaining = normalized.length - start;
     final maxEnd = (start + safeMaxSize).clamp(0, normalized.length);
-    final punctEnd = _findNextSeparator(normalized, start, maxEnd, resolvedSeparators);
-    final punctuationSize = punctEnd != null ? punctEnd - start : remaining;
-    final targetSize = punctuationSize.clamp(safeMinSize, safeMaxSize);
-    final end = (start + targetSize).clamp(0, normalized.length);
+    final separatorIndex = _findNextSeparatorIndex(normalized, start, maxEnd, separatorSet);
+    final separatorSize = separatorIndex != null ? separatorIndex - start : remaining;
+    final targetSize = remaining <= safeMinSize
+        ? remaining
+        : min(safeMaxSize, max(safeMinSize, separatorSize));
+    final useRemainingTail = remaining - targetSize < safeMinSize;
+    final end = (start + (useRemainingTail ? remaining : targetSize)).clamp(0, normalized.length);
     final piece = normalized.substring(start, end).trim();
     if (piece.isNotEmpty) {
       chunks.add(piece);
@@ -71,7 +83,10 @@ List<String> splitIntoChunks(
     if (end >= normalized.length) {
       break;
     }
-    final nextStart = end - safeOverlap;
+    var nextStart = end - safeOverlap;
+    if (nextStart == end && separatorIndex == end) {
+      nextStart = min(end + 1, normalized.length);
+    }
     start = nextStart > start ? nextStart : end;
     if (start < 0) {
       start = 0;
@@ -109,14 +124,13 @@ List<String> _normalizeSeparators(List<String>? separators) {
   return seen.toList();
 }
 
-int? _findNextSeparator(String text, int start, int end, List<String> separators) {
+int? _findNextSeparatorIndex(String text, int start, int end, Set<String> separators) {
   if (separators.isEmpty) {
     return null;
   }
-  final separatorSet = separators.toSet();
   for (var index = start; index < end; index += 1) {
-    if (separatorSet.contains(text[index])) {
-      return index + 1;
+    if (separators.contains(text[index])) {
+      return index;
     }
   }
   return null;

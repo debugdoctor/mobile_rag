@@ -418,6 +418,7 @@ class DbService {
 
   Future<List<ChunkRow>> listDocumentChunksForKnowledgeBases({
     List<String>? knowledgeBaseIds,
+    int? limit,
   }) async {
     final params = <Variable<Object>>[];
     final conditions = <String>[];
@@ -427,6 +428,7 @@ class DbService {
       params.addAll(knowledgeBaseIds.map((id) => Variable<String>(id)));
     }
     final whereClause = conditions.isNotEmpty ? 'WHERE ${conditions.join(' AND ')}' : '';
+    final limitClause = limit != null ? 'LIMIT ?' : '';
 
     final rows = await _db.customSelect(
       '''
@@ -442,9 +444,13 @@ class DbService {
         JOIN documents doc ON doc.id = chunk.document_id
         $whereClause
     ORDER BY doc.updated_at DESC, chunk.chunk_index ASC
+        $limitClause
       ''',
       readsFrom: {_db.documentChunks, _db.documents},
-      variables: params,
+      variables: [
+        ...params,
+        if (limit != null) Variable<int>(limit),
+      ],
     ).get();
 
     return rows.map((row) => ChunkRow.fromData(row.data)).toList();
@@ -455,8 +461,8 @@ class DbService {
     int limit, {
     List<String>? knowledgeBaseIds,
   }) async {
-    final pattern = '%$query%';
-    final conditions = <String>['chunk.content LIKE ?'];
+    final pattern = '%${_escapeLike(query)}%';
+    final conditions = <String>['chunk.content LIKE ? ESCAPE \'\\\''];
     final params = <Variable<Object>>[Variable<String>(pattern)];
     if (knowledgeBaseIds != null && knowledgeBaseIds.isNotEmpty) {
       final placeholders = List.filled(knowledgeBaseIds.length, '?').join(', ');
@@ -493,8 +499,8 @@ class DbService {
     int limit, {
     List<String>? knowledgeBaseIds,
   }) async {
-    final pattern = '%$query%';
-    final conditions = <String>['(title LIKE ? OR content LIKE ?)'];
+    final pattern = '%${_escapeLike(query)}%';
+    final conditions = <String>['(title LIKE ? ESCAPE \'\\\' OR content LIKE ? ESCAPE \'\\\')'];
     final params = <Variable<Object>>[Variable<String>(pattern), Variable<String>(pattern)];
     if (knowledgeBaseIds != null && knowledgeBaseIds.isNotEmpty) {
       final placeholders = List.filled(knowledgeBaseIds.length, '?').join(', ');
@@ -516,6 +522,10 @@ class DbService {
     ).get();
 
     return rows.map((row) => DocumentRow.fromData(row.data)).toList();
+  }
+
+  String _escapeLike(String value) {
+    return value.replaceAll(r'\', r'\\').replaceAll('%', r'\%').replaceAll('_', r'\_');
   }
 
   Future<List<Conversation>> listConversations() async {
@@ -592,6 +602,10 @@ class DbService {
     await (_db.delete(_db.conversations)..where((tbl) => tbl.id.equals(conversationId))).go();
   }
 
+  Future<void> deleteMessage(String messageId) async {
+    await (_db.delete(_db.messages)..where((tbl) => tbl.id.equals(messageId))).go();
+  }
+
   Future<List<Message>> listMessages(String conversationId) async {
     final rows = await (_db.select(_db.messages)
           ..where((tbl) => tbl.conversationId.equals(conversationId))
@@ -635,6 +649,19 @@ class DbService {
     );
 
     return Message(id: id, role: role, content: content, createdAt: now, metadata: metadata);
+  }
+
+  Future<void> updateMessageContent(String messageId, String content) async {
+    await (_db.update(_db.messages)..where((tbl) => tbl.id.equals(messageId))).write(
+      db.MessagesCompanion(content: Value(content)),
+    );
+  }
+
+  Future<void> updateMessageMetadata(String messageId, MessageMetadata? metadata) async {
+    final serialized = MessageMetadata.serialize(metadata);
+    await (_db.update(_db.messages)..where((tbl) => tbl.id.equals(messageId))).write(
+      db.MessagesCompanion(metadata: Value(serialized)),
+    );
   }
 
   Future<Map<String, String?>> getSettings(List<String> keys) async {

@@ -11,7 +11,7 @@ class AiMessage {
   AiMessage({required this.role, required this.content});
 
   final String role;
-  final String content;
+  final Object content;
 
   Map<String, dynamic> toJson() => {'role': role, 'content': content};
 }
@@ -41,6 +41,20 @@ class EmbeddingRequestOptions {
 
   final Object input;
   final String? model;
+}
+
+class FileUnderstandingAttachment {
+  FileUnderstandingAttachment({
+    required this.name,
+    this.text,
+    this.mimeType,
+    this.base64Data,
+  });
+
+  final String name;
+  final String? text;
+  final String? mimeType;
+  final String? base64Data;
 }
 
 class ApiService {
@@ -85,7 +99,9 @@ class ApiService {
 
   Future<String> requestAiAnswerStream(
     AiRequestOptions options,
-    void Function(String chunk) onChunk,
+    void Function(String chunk) onChunk, {
+    CancelToken? cancelToken,
+  }
   ) async {
     final locale = await _storage.getLocale();
     final config = await _storage.getAiConfig();
@@ -108,6 +124,7 @@ class ApiService {
         headers: headers,
         responseType: ResponseType.stream,
       ),
+      cancelToken: cancelToken,
     );
 
     if (response.statusCode == null || response.statusCode! >= 300) {
@@ -213,6 +230,85 @@ class ApiService {
     }
 
     throw StateError(translate(locale, 'error.embeddingResponseInvalid'));
+  }
+
+  Future<String> requestFileUnderstanding({
+    required String prompt,
+    required List<FileUnderstandingAttachment> attachments,
+    String? model,
+  }) async {
+    final locale = await _storage.getLocale();
+    final config = await _storage.getAiConfig();
+    if (config.url.isEmpty) {
+      throw StateError(translate(locale, 'error.missingAiUrl'));
+    }
+    final resolvedModel = _pickModel(model, config.model);
+    if (resolvedModel.isEmpty) {
+      throw StateError(translate(locale, 'error.missingChatModel'));
+    }
+
+    final headers = _buildHeaders(config.apiKey, accept: 'application/json');
+    final url = '${config.url.replaceAll(RegExp(r'/*$'), '')}/chat/completions';
+
+    final imageAttachments = attachments
+        .where((item) => (item.mimeType ?? '').startsWith('image/') && item.base64Data != null)
+        .toList();
+    final textBlocks = attachments
+        .where((item) => (item.text ?? '').trim().isNotEmpty)
+        .map((item) => 'File: ${item.name}\n${item.text}')
+        .join('\n\n');
+    final imageLabel = imageAttachments.isEmpty
+        ? ''
+        : 'Images: ${imageAttachments.map((item) => item.name).join(', ')}';
+    final promptText = [
+      if (textBlocks.isNotEmpty) textBlocks,
+      if (imageLabel.isNotEmpty) imageLabel,
+    ].join('\n\n').trim();
+
+    Object userContent = promptText;
+    if (imageAttachments.isNotEmpty) {
+      final parts = <Map<String, Object>>[
+        {'type': 'text', 'text': promptText.isEmpty ? 'See attached images.' : promptText},
+        ...imageAttachments.map(
+              (item) => {
+                'type': 'image_url',
+                'image_url': {'url': 'data:${item.mimeType};base64,${item.base64Data}'},
+              },
+            ),
+      ];
+      userContent = parts;
+    }
+
+    final payload = _buildChatPayload(
+      AiRequestOptions(
+        messages: [
+          AiMessage(role: 'system', content: prompt),
+          AiMessage(role: 'user', content: userContent),
+        ],
+        model: resolvedModel,
+      ),
+      config,
+      stream: false,
+      model: resolvedModel,
+    );
+
+    final response = await _dio.post(
+      url,
+      data: payload,
+      options: Options(headers: headers, responseType: ResponseType.json),
+    );
+
+    if (response.statusCode == null || response.statusCode! >= 300) {
+      throw StateError(_parseError(response, locale));
+    }
+    final data = response.data;
+    if (data is Map<String, dynamic>) {
+      return _extractText(data, locale);
+    }
+    if (data is String) {
+      return data;
+    }
+    return _extractText({}, locale);
   }
 
   Future<List<double>> requestEmbedding(EmbeddingRequestOptions options) async {

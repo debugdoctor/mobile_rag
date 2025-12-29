@@ -15,6 +15,7 @@ import 'features/settings/settings_screen.dart';
 import 'features/settings/models_screen.dart';
 import 'features/settings/chat_models_screen.dart';
 import 'features/settings/embedding_models_screen.dart';
+import 'features/settings/prompt_templates_screen.dart';
 
 final _router = GoRouter(
   initialLocation: '/chat',
@@ -71,6 +72,10 @@ final _router = GoRouter(
               path: 'embedding-models',
               builder: (context, state) => const EmbeddingModelsScreen(),
             ),
+            GoRoute(
+              path: 'prompts',
+              builder: (context, state) => const PromptTemplatesScreen(),
+            ),
           ],
         ),
       ],
@@ -94,7 +99,7 @@ class App extends ConsumerWidget {
     final locale = ref.watch(localeControllerProvider).locale;
 
     return MaterialApp.router(
-      title: 'Mobile RAG',
+      title: translate(locale, 'app.title'),
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
       themeMode: ThemeMode.system,
@@ -110,7 +115,7 @@ class App extends ConsumerWidget {
   }
 }
 
-class _MainShell extends StatelessWidget {
+class _MainShell extends ConsumerWidget {
   const _MainShell({required this.child});
 
   final Widget child;
@@ -126,9 +131,10 @@ class _MainShell extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final location = GoRouterState.of(context).uri.toString();
     final currentIndex = _locationToIndex(location);
+    final locale = ref.watch(localeControllerProvider).locale;
 
     return Scaffold(
       body: child,
@@ -147,18 +153,18 @@ class _MainShell extends StatelessWidget {
               context.go('/chat');
           }
         },
-        items: const [
+        items: [
           BottomNavigationBarItem(
             icon: Icon(Icons.chat_bubble_outline),
-            label: 'Chat',
+            label: translate(locale, 'nav.chat'),
           ),
           BottomNavigationBarItem(
             icon: Icon(Icons.library_books_outlined),
-            label: 'Knowledge',
+            label: translate(locale, 'nav.knowledge'),
           ),
           BottomNavigationBarItem(
             icon: Icon(Icons.settings_outlined),
-            label: 'Settings',
+            label: translate(locale, 'nav.settings'),
           ),
         ],
       ),

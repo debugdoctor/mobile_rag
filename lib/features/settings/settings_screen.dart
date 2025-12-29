@@ -16,15 +16,19 @@ class SettingsScreen extends ConsumerStatefulWidget {
 
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   bool _loading = true;
+  bool _encryptionKeyLost = false;
   String _localeDraft = 'en';
   String _retrievalTopKDraft = '';
+  String _retrievalSimilarityDraft = '';
   String _retrievalModeDraft = 'hybrid';
   String? _localeError;
   String? _retrievalError;
+  String? _retrievalSimilarityError;
   Timer? _localeDebounce;
   Timer? _retrievalDebounce;
   Timer? _modeDebounce;
   final _retrievalTopKController = TextEditingController();
+  final _retrievalSimilarityController = TextEditingController();
 
   @override
   void initState() {
@@ -38,6 +42,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _retrievalDebounce?.cancel();
     _modeDebounce?.cancel();
     _retrievalTopKController.dispose();
+    _retrievalSimilarityController.dispose();
     super.dispose();
   }
 
@@ -45,14 +50,18 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final storage = ref.read(storageServiceProvider);
     final locale = await storage.getLocale();
     final rag = await storage.getRagConfig();
+    final keyLost = await storage.getEncryptionKeyLost();
     if (!mounted) {
       return;
     }
     setState(() {
       _localeDraft = locale;
       _retrievalTopKDraft = rag.retrievalTopK.toString();
+      _retrievalSimilarityDraft = rag.retrievalSimilarityThreshold.toString();
       _retrievalModeDraft = rag.retrievalMode;
       _retrievalTopKController.text = _retrievalTopKDraft;
+      _retrievalSimilarityController.text = _retrievalSimilarityDraft;
+      _encryptionKeyLost = keyLost;
       _loading = false;
     });
   }
@@ -101,6 +110,37 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     });
   }
 
+  void _updateRetrievalSimilarity(String value) {
+    setState(() {
+      _retrievalSimilarityDraft = value;
+    });
+    if (value.trim().isEmpty) {
+      setState(() {
+        _retrievalSimilarityError = null;
+      });
+      _retrievalDebounce?.cancel();
+      _retrievalDebounce = Timer(const Duration(milliseconds: 400), () async {
+        await ref.read(storageServiceProvider).setRagConfig(retrievalSimilarityThreshold: 0);
+      });
+      return;
+    }
+    final parsed = _toDoubleInRange(value, 0, 1);
+    if (parsed == null) {
+      setState(() {
+        _retrievalSimilarityError = translate(ref.read(localeControllerProvider).locale, 'settings.error.invalidRange',
+            {'min': '0', 'max': '1', 'fields': translate(ref.read(localeControllerProvider).locale, 'settings.retrieval.similarity')});
+      });
+      return;
+    }
+    setState(() {
+      _retrievalSimilarityError = null;
+    });
+    _retrievalDebounce?.cancel();
+    _retrievalDebounce = Timer(const Duration(milliseconds: 400), () async {
+      await ref.read(storageServiceProvider).setRagConfig(retrievalSimilarityThreshold: parsed);
+    });
+  }
+
   void _updateRetrievalMode(String value) {
     setState(() {
       _retrievalModeDraft = value;
@@ -127,6 +167,29 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         padding: const EdgeInsets.all(16),
         children: [
           Text(translate(locale, 'settings.autoSave'), style: TextStyle(color: palette.onSurface.withAlpha(140))),
+          if (_encryptionKeyLost) ...[
+            const SizedBox(height: 12),
+            Card(
+              color: palette.errorContainer,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      translate(locale, 'settings.security.keyLostTitle'),
+                      style: TextStyle(color: palette.onErrorContainer, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      translate(locale, 'settings.security.keyLostMessage'),
+                      style: TextStyle(color: palette.onErrorContainer.withAlpha(210)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 16),
           Card(
             child: Padding(
@@ -168,6 +231,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ),
           const SizedBox(height: 12),
           Card(
+            child: ListTile(
+              title: Text(translate(locale, 'settings.prompt.title')),
+              subtitle: Text(translate(locale, 'settings.prompt.helper')),
+              trailing: Icon(Icons.chevron_right, color: palette.primary),
+              onTap: () => context.go('/settings/prompts'),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
               child: Column(
@@ -181,13 +253,26 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   const SizedBox(height: 6),
                   TextField(
                     keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(hintText: '12'),
+                    decoration: InputDecoration(hintText: translate(locale, 'settings.retrieval.topKPlaceholder')),
                     onChanged: _updateRetrievalTopK,
                     controller: _retrievalTopKController,
                   ),
                   if (_retrievalError != null) ...[
                     const SizedBox(height: 8),
                     Text(_retrievalError!, style: TextStyle(color: palette.error)),
+                  ],
+                  const SizedBox(height: 12),
+                  Text(translate(locale, 'settings.retrieval.similarity')),
+                  const SizedBox(height: 6),
+                  TextField(
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    decoration: InputDecoration(hintText: translate(locale, 'settings.retrieval.similarityPlaceholder')),
+                    onChanged: _updateRetrievalSimilarity,
+                    controller: _retrievalSimilarityController,
+                  ),
+                  if (_retrievalSimilarityError != null) ...[
+                    const SizedBox(height: 8),
+                    Text(_retrievalSimilarityError!, style: TextStyle(color: palette.error)),
                   ],
                   const SizedBox(height: 12),
                   Text(translate(locale, 'settings.retrieval.mode')),
@@ -224,6 +309,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   int? _toPositiveInt(String value) {
     final parsed = int.tryParse(value.trim());
     if (parsed == null || parsed <= 0) {
+      return null;
+    }
+    return parsed;
+  }
+
+  double? _toDoubleInRange(String value, double min, double max) {
+    final parsed = double.tryParse(value.trim());
+    if (parsed == null || parsed < min || parsed > max) {
       return null;
     }
     return parsed;

@@ -195,3 +195,31 @@ class Message {
   final String? createdAt;
   final MessageMetadata? metadata;
 }
+
+class PromptTemplate {
+  const PromptTemplate({
+    required this.id,
+    required this.title,
+    required this.content,
+  });
+
+  final String id;
+  final String title;
+  final String content;
+
+  factory PromptTemplate.fromJson(Map<String, dynamic> json) {
+    return PromptTemplate(
+      id: json['id'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      content: json['content'] as String? ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'content': content,
+      };
+}
+
+const String defaultPromptTemplateId = 'prompt_default';
