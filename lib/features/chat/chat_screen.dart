@@ -55,6 +55,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   String? _pendingRetryAttachmentsContent;
   String? _pendingRetryPromptId;
   String? _lastErrorMessageId;
+  bool _showRetryNotice = false;
   final List<_PendingAttachment> _pendingAttachments = [];
   List<FileUnderstandingAttachment> _pendingAttachmentPayloads = [];
   final Map<String, String> _attachmentSummaries = {};
@@ -434,6 +435,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _pendingRetryConversationId = null;
         _pendingRetryAttachmentsContent = null;
         _pendingRetryPromptId = null;
+        _showRetryNotice = false;
       });
     } catch (error) {
       chunkTimer?.cancel();
@@ -445,6 +447,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           _pendingRetryAttachmentsContent = null;
           _pendingRetryPromptId = null;
           _lastErrorMessageId = null;
+          _showRetryNotice = false;
         });
         return;
       }
@@ -476,6 +479,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _pendingRetryConversationId = conversationId;
         _pendingRetryAttachmentsContent = attachmentsContent;
         _pendingRetryPromptId = promptTemplateId;
+        _showRetryNotice = true;
       });
       _showMessage(friendlyError);
     } finally {
@@ -713,6 +717,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       _pendingRetryConversationId = null;
       _pendingRetryAttachmentsContent = null;
       _pendingRetryPromptId = null;
+      _showRetryNotice = false;
     });
     final promptContent = _buildSystemPrompt(content, templateId: promptId);
     await _sendAssistantResponse(
@@ -953,6 +958,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   String _formatErrorMessage(Object error, String locale) {
     if (error is StateError) {
       return error.message;
+    }
+    if (error is DioException) {
+      if (error.type == DioExceptionType.connectionError) {
+        return translate(locale, 'error.networkUnavailable');
+      }
+      if (error.type == DioExceptionType.connectionTimeout ||
+          error.type == DioExceptionType.receiveTimeout ||
+          error.type == DioExceptionType.sendTimeout) {
+        return translate(locale, 'error.requestTimeout');
+      }
+      if (error.type == DioExceptionType.badResponse) {
+        final status = error.response?.statusCode;
+        if (status != null) {
+          return translate(locale, 'error.requestFailed', {'status': status});
+        }
+      }
+      final inner = error.error;
+      if (inner is SocketException) {
+        return translate(locale, 'error.networkUnavailable');
+      }
+      if (inner is FormatException) {
+        return translate(locale, 'error.invalidUrl');
+      }
+    }
+    if (error is SocketException) {
+      return translate(locale, 'error.networkUnavailable');
+    }
+    if (error is FormatException) {
+      return translate(locale, 'error.invalidUrl');
     }
     return translate(locale, 'error.unknown');
   }
@@ -1363,6 +1397,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             icon: const Icon(Icons.library_books_outlined),
             tooltip: translate(locale, 'chat.knowledge.select'),
           ),
+          if (_pendingRetryContent != null && !_showRetryNotice)
+            IconButton(
+              onPressed: _retrySend,
+              icon: const Icon(Icons.refresh),
+              tooltip: translate(locale, 'common.retry'),
+            ),
           IconButton(
             onPressed: _openModelPicker,
             icon: const Icon(Icons.smart_toy_outlined),
@@ -1382,6 +1422,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ),
       body: Stack(
         children: [
+          if (_showRetryNotice && _pendingRetryContent != null)
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onTap: () {
+                  setState(() {
+                    _showRetryNotice = false;
+                  });
+                },
+              ),
+            ),
           Column(
             children: [
               Expanded(
@@ -1491,7 +1542,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                           ),
                           const SizedBox(width: 12),
                           IconButton(
-                            onPressed: _streamingMessageId != null ? _stopStreaming : (_isSending ? null : _handleSend),
+                            onPressed: _streamingMessageId != null
+                                ? _stopStreaming
+                                : (_isSending || _isProcessingAttachments ? null : _handleSend),
                             icon: Icon(_streamingMessageId != null ? Icons.stop_circle : Icons.send),
                           ),
                         ],
@@ -1502,7 +1555,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               ),
             ],
           ),
-          if (_pendingRetryContent != null)
+          if (_showRetryNotice && _pendingRetryContent != null)
             Positioned(
               left: 16,
               right: 16,
