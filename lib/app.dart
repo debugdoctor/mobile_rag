@@ -63,14 +63,16 @@ final _router = GoRouter(
             GoRoute(
               path: 'models',
               builder: (context, state) => const ModelsScreen(),
-            ),
-            GoRoute(
-              path: 'chat-models',
-              builder: (context, state) => const ChatModelsScreen(),
-            ),
-            GoRoute(
-              path: 'embedding-models',
-              builder: (context, state) => const EmbeddingModelsScreen(),
+              routes: [
+                GoRoute(
+                  path: 'chat-models',
+                  builder: (context, state) => const ChatModelsScreen(),
+                ),
+                GoRoute(
+                  path: 'embedding-models',
+                  builder: (context, state) => const EmbeddingModelsScreen(),
+                ),
+              ],
             ),
             GoRoute(
               path: 'prompts',

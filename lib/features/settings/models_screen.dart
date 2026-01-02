@@ -28,13 +28,13 @@ class ModelsScreen extends ConsumerWidget {
           _CardLink(
             title: translate(locale, 'settings.models.chat'),
             subtitle: translate(locale, 'settings.models.chatDesc'),
-            onTap: () => context.go('/settings/chat-models'),
+            onTap: () => context.go('/settings/models/chat-models'),
           ),
           const SizedBox(height: 12),
           _CardLink(
             title: translate(locale, 'settings.models.embedding'),
             subtitle: translate(locale, 'settings.models.embeddingDesc'),
-            onTap: () => context.go('/settings/embedding-models'),
+            onTap: () => context.go('/settings/models/embedding-models'),
           ),
         ],
       ),
