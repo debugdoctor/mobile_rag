@@ -243,7 +243,7 @@ const Map<String, Map<String, String>> translations = {
     'settings.prompt.placeholder': 'Write a system prompt to guide responses.',
     'settings.prompt.required': 'Title and content are required.',
     'settings.prompt.deleteTitle': 'Delete prompt',
-    'settings.prompt.deleteMessage': 'Delete \"{title}\"?',
+    'settings.prompt.deleteMessage': 'Delete "{title}"?',
     'settings.prompt.empty': 'No prompts yet.',
     'settings.prompt.defaultTitle': 'Default prompt',
     'settings.prompt.defaultLocked': 'Default prompt is read-only.',

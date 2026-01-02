@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
-
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -17,7 +15,6 @@ import 'package:share_plus/share_plus.dart';
 import '../../app_providers.dart';
 import '../../core/i18n.dart';
 import '../../domain/models.dart';
-import '../../services/api_service.dart';
 import '../../services/rag_service.dart';
 import '../../utils/attachment_extractor.dart';
 import '../../utils/file_text_extractor.dart';
@@ -57,7 +54,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   String? _lastErrorMessageId;
   bool _showRetryNotice = false;
   final List<_PendingAttachment> _pendingAttachments = [];
-  List<FileUnderstandingAttachment> _pendingAttachmentPayloads = [];
+  String? _pendingAttachmentTextContent;
   final Map<String, String> _attachmentSummaries = {};
   bool _knowledgeEnhancementEnabled = true;
   bool _showKnowledgeToast = false;
@@ -281,7 +278,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       _isSending = true;
     });
 
-    final attachmentsSummary = await _prepareAttachmentSummary(text);
+    String? attachmentsSummary;
+    if (_pendingAttachments.isNotEmpty) {
+      attachmentsSummary = await _prepareAttachmentContent();
+    }
     if (_pendingAttachments.isNotEmpty && attachmentsSummary == null) {
       if (mounted) {
         setState(() {
@@ -314,7 +314,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (_pendingAttachments.isNotEmpty && attachmentsSummary != null) {
       setState(() {
         _pendingAttachments.clear();
-        _pendingAttachmentPayloads = [];
+        _pendingAttachmentTextContent = null;
       });
     }
 
@@ -803,7 +803,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Future<void> _openPromptPicker() async {
     final locale = ref.read(localeControllerProvider).locale;
     await _loadPromptTemplates();
-    if (!context.mounted) {
+    if (!mounted) {
       return;
     }
     await showModalBottomSheet<void>(
@@ -1046,7 +1046,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (_pendingAttachments.isEmpty) {
       if (mounted) {
         setState(() {
-          _pendingAttachmentPayloads = [];
+          _pendingAttachmentTextContent = null;
           _isProcessingAttachments = false;
         });
       }
@@ -1058,10 +1058,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       });
     }
     try {
-      final payloads = await _buildAttachmentPayloads();
+      final textContent = await _buildTextAttachmentContent();
       if (mounted) {
         setState(() {
-          _pendingAttachmentPayloads = payloads;
+          _pendingAttachmentTextContent = textContent.isNotEmpty ? textContent : null;
         });
       }
     } catch (error) {
@@ -1075,56 +1075,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
   }
 
-  Future<String?> _prepareAttachmentSummary(String question) async {
+  Future<String?> _prepareAttachmentContent() async {
     if (_pendingAttachments.isEmpty) {
       return null;
     }
-    final locale = ref.read(localeControllerProvider).locale;
-    setState(() {
-      _isProcessingAttachments = true;
-    });
-    try {
-      final storage = ref.read(storageServiceProvider);
-      final config = await storage.getAiConfig();
-      final model = config.model;
-      final api = ref.read(apiServiceProvider);
-      final payloads =
-          _pendingAttachmentPayloads.isNotEmpty ? _pendingAttachmentPayloads : await _buildAttachmentPayloads();
-      if (payloads.isEmpty) {
-        return '';
-      }
-      final prompt = translate(locale, 'chat.attach.prompt', {'question': question});
-      final summary = await api.requestFileUnderstanding(
-        prompt: prompt,
-        attachments: payloads,
-        model: model,
-      );
-      return summary.trim();
-    } catch (error) {
-      _showMessage(error.toString());
-      return null;
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isProcessingAttachments = false;
-        });
-      }
-    }
+    final textContent = _pendingAttachmentTextContent?.trim() ?? '';
+    return textContent.isEmpty ? '' : textContent;
   }
 
-  Future<List<FileUnderstandingAttachment>> _buildAttachmentPayloads() async {
+  Future<String> _buildTextAttachmentContent() async {
     const maxTextLength = 12000;
-    final payloads = <FileUnderstandingAttachment>[];
+    final buffer = StringBuffer();
     for (final attachment in _pendingAttachments) {
       if (attachment.isImage) {
-        final base64Data = base64Encode(attachment.bytes);
-        payloads.add(
-          FileUnderstandingAttachment(
-            name: attachment.name,
-            mimeType: attachment.mimeType ?? guessAttachmentMime(attachment.name),
-            base64Data: base64Data,
-          ),
-        );
         continue;
       }
       try {
@@ -1139,12 +1102,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           continue;
         }
         final limited = trimmed.length > maxTextLength ? trimmed.substring(0, maxTextLength) : trimmed;
-        payloads.add(FileUnderstandingAttachment(name: attachment.name, text: limited));
+        if (buffer.isNotEmpty) {
+          buffer.writeln();
+        }
+        buffer.writeln('${attachment.name}:');
+        buffer.writeln(limited);
       } catch (error) {
         _showMessage('$error');
       }
     }
-    return payloads;
+    return buffer.toString().trim();
   }
 
   String? _latestAssistantMessageId() {
@@ -1286,25 +1253,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     return '${trimmed.substring(0, 50)}...';
   }
 
-  String _buildExportText(List<Message> messages, String? conversationId, String locale) {
-    final header = [
-      translate(locale, 'chat.export.title'),
-      translate(locale, 'chat.export.sessionId', {'id': conversationId ?? translate(locale, 'common.placeholder')}),
-      translate(locale, 'chat.export.time', {'time': formatDateTime(DateTime.now().toIso8601String(), locale)}),
-      '',
-    ];
-    final blocks = messages.map((message) {
-      final roleLabel = switch (message.role) {
-        MessageRole.user => translate(locale, 'chat.role.user'),
-        MessageRole.assistant => translate(locale, 'chat.role.assistant'),
-        MessageRole.system => translate(locale, 'chat.role.system'),
-      };
-      final timestamp = message.createdAt != null ? formatDateTime(message.createdAt, locale) : '';
-      return '$roleLabel${timestamp.isNotEmpty ? ' ($timestamp)' : ''}:\\n${message.content}';
-    }).toList();
-    return [...header, ...blocks].join('\\n\\n');
-  }
-
   String _buildExportMarkdown(List<Message> messages, String? conversationId, String locale) {
     final header = [
       '# ${translate(locale, 'chat.export.title')}',
@@ -1330,18 +1278,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         for (final item in evidence) {
           final title = item.documentTitle ?? translate(locale, 'context.untitled');
           final index = item.chunkIndex != null ? '#${item.chunkIndex}' : '';
-          final hitRateText = item.hitRate != null
-              ? translate(locale, 'chat.evidence.hitRate',
-                  {'value': (item.hitRate! * 100).toStringAsFixed(0)})
-              : null;
-          final similarityText = item.similarity != null
-              ? translate(locale, 'chat.evidence.similarity',
-                  {'value': (item.similarity! * 100).toStringAsFixed(0)})
-              : null;
-          final stats = [
-            if (hitRateText != null) hitRateText,
-            if (similarityText != null) similarityText,
-          ];
+          final hitRateText = translate(locale, 'chat.evidence.hitRate',
+              {'value': (item.hitRate * 100).toStringAsFixed(0)});
+          final similarityText = translate(locale, 'chat.evidence.similarity',
+              {'value': (item.similarity * 100).toStringAsFixed(0)});
+          final stats = [hitRateText, similarityText];
           parts.add('- $title ${index.isNotEmpty ? index : ''}${stats.isNotEmpty ? ' · ${stats.join(' · ')}' : ''}'.trim());
           final snippet = item.snippet.trim();
           if (snippet.isNotEmpty) {
@@ -1377,10 +1318,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final palette = Theme.of(context).colorScheme;
     final modelLabel = _chatModel.isNotEmpty ? _chatModel : translate(locale, 'chat.model.missing');
     final knowledgeColor = _knowledgeEnhancementEnabled ? palette.primary : palette.onSurface;
-    final selectedPrompt = _promptTemplates.firstWhere(
-      (item) => item.id == _selectedPromptTemplateId,
-      orElse: () => PromptTemplate(id: '', title: '', content: ''),
-    );
     final promptLabel = translate(locale, 'chat.prompt.placeholder');
 
     return Scaffold(
@@ -1742,18 +1679,11 @@ class _MessageBubble extends StatelessWidget {
                       ...evidence.map((item) {
                         final title = item.documentTitle ?? translate(locale, 'context.untitled');
                         final index = item.chunkIndex != null ? '#${item.chunkIndex}' : '';
-                        final hitRateText = item.hitRate != null
-                            ? translate(locale, 'chat.evidence.hitRate',
-                                {'value': (item.hitRate! * 100).toStringAsFixed(0)})
-                            : null;
-                        final similarityText = item.similarity != null
-                            ? translate(locale, 'chat.evidence.similarity',
-                                {'value': (item.similarity! * 100).toStringAsFixed(0)})
-                            : null;
-                        final stats = [
-                          if (hitRateText != null) hitRateText,
-                          if (similarityText != null) similarityText,
-                        ];
+                        final hitRateText = translate(locale, 'chat.evidence.hitRate',
+                            {'value': (item.hitRate * 100).toStringAsFixed(0)});
+                        final similarityText = translate(locale, 'chat.evidence.similarity',
+                            {'value': (item.similarity * 100).toStringAsFixed(0)});
+                        final stats = [hitRateText, similarityText];
                         return Padding(
                           padding: const EdgeInsets.only(bottom: 8),
                           child: Column(

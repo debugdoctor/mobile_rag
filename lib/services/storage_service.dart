@@ -114,7 +114,6 @@ class StorageService {
   final DbService _db;
   Future<void>? _encryptionInit;
   encrypt.Key? _encryptionKey;
-  String? _encryptionKeyId;
 
   Future<String> getLocale() async {
     final stored = await _db.getSettings([_storageKeys['locale']!]);
@@ -444,7 +443,6 @@ class StorageService {
             if (storedId != null && storedId.isNotEmpty && storedId != id) {
               await _handleEncryptionKeyLost();
             }
-            _encryptionKeyId = id;
             _encryptionKey = encrypt.Key(base64Decode(key));
             if (storedId == null || storedId.isEmpty) {
               await _db.setSetting(_storageKeys['encryptionKeyId']!, id);
@@ -471,7 +469,6 @@ class StorageService {
     });
     await keyFile.writeAsString(payload);
     await _db.setSetting(_storageKeys['encryptionKeyId']!, nextId);
-    _encryptionKeyId = nextId;
     _encryptionKey = encrypt.Key(bytes);
   }
 
